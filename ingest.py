@@ -8,11 +8,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 
-
 CHROMA_DIR = os.environ.get("CHROMA_DIR", "data/chroma")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
-# served by Ollama: `ollama pull bge-m3`
-# alternatives: "nomic-embed-text" (English-leaning), "embeddinggemma"
 
 _embeddings = None
 
@@ -49,8 +46,17 @@ def extract_text(path: str) -> str:
     raise ValueError(f"Unsupported file type: {ext}")
 
 
-def ingest_file(path: str) -> int:
-    """Extract, chunk, and store a file. Returns number of chunks added."""
+def is_indexed(filename: str) -> bool:
+    """True if a file with this name already has chunks in the store."""
+    return filename in set(list_sources())
+
+
+def ingest_file(path: str, skip_if_indexed: bool = True) -> int:
+    """Extract, chunk, and store a file. Returns chunks added (0 if skipped)."""
+    name = Path(path).name
+    if skip_if_indexed and is_indexed(name):
+        return 0
+
     text = extract_text(path)
     if not text.strip():
         return 0
@@ -61,7 +67,7 @@ def ingest_file(path: str) -> int:
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     chunks = splitter.split_text(text)
-    metadatas = [{"source": Path(path).name, "chunk": i} for i in range(len(chunks))]
+    metadatas = [{"source": name, "chunk": i} for i in range(len(chunks))]
 
     vs = get_vectorstore()
     vs.add_texts(chunks, metadatas=metadatas)
