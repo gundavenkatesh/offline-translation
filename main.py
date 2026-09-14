@@ -1,144 +1,89 @@
-"""Streamlit UI: auto-ingest, bilingual chat, bidirectional translation."""
+"""RAG chain: retrieve relevant chunks, answer in the user's language via Ollama."""
 import os
-from pathlib import Path
+import re
 
-import streamlit as st
+from langchain_ollama import ChatOllama
 
-from ingest import ingest_file, list_sources, is_indexed
-from rag import answer_question
-from translate import get_translation, active_engine
+from ingest import get_vectorstore, extract_text
 
-UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "data/uploads"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3:4b")
 
-st.set_page_config(page_title="Offline Document Chatbot", page_icon="📄")
-st.title("📄 Offline Document Chatbot")
+# Feature 3: mirror the question's language instead of forcing English.
+SYSTEM_PROMPT = """You are a document assistant. Answer the user's question using ONLY the provided context.
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "handled_uploads" not in st.session_state:
-    st.session_state.handled_uploads = set()
+Rules:
+- Respond in the SAME language as the user's question. If they ask in German, answer in German; if they ask in English, answer in English.
+- If the context does not contain the answer, say so clearly in that same language. Do not invent information.
+- Cite the source file name when referencing information.
+- Be concise and direct.
+/no_think"""
 
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.header("Documents")
+TRANSLATE_PROMPT = """Translate the following text to English. Preserve structure, headings, and lists. Output only the translation, nothing else.
 
-    # Feature 1: auto-ingest on upload (no Ingest button), with dedup + status.
-    uploaded = st.file_uploader(
-        "Upload documents (indexed automatically)",
-        type=["pdf", "docx", "txt", "md"],
-        accept_multiple_files=True,
-    )
-    if uploaded:
-        for f in uploaded:
-            key = f"{f.name}:{f.size}"
-            if key in st.session_state.handled_uploads:
-                continue
-            dest = UPLOAD_DIR / f.name
-            dest.write_bytes(f.getbuffer())
-            if is_indexed(f.name):
-                st.info(f"↩︎ {f.name} already indexed — skipped")
-            else:
-                with st.spinner(f"Indexing {f.name}…"):
-                    n = ingest_file(str(dest))
-                st.success(f"✓ {f.name}: {n} chunks indexed")
-            st.session_state.handled_uploads.add(key)
+Text:
+{text}
+/no_think"""
 
-    sources = list_sources()
-    if sources:
-        st.subheader("Indexed files")
-        for s in sources:
-            st.text(f"• {s}")
 
-        st.divider()
-        st.subheader("Full translation")
+def strip_think(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-        # Feature 2: direction toggle, default DE -> EN.
-        direction_label = st.radio(
-            "Direction",
-            ["German → English", "English → German"],
-            index=0,
-            horizontal=True,
-        )
-        direction = "de-en" if direction_label.startswith("German") else "en-de"
 
-        sel = st.selectbox("File to translate", sources)
+def get_llm() -> ChatOllama:
+    return ChatOllama(model=LLM_MODEL, temperature=0.1)
 
-        translating = st.session_state.get("translating", False)
-        if st.button("Translate", disabled=translating):
-            st.session_state.translating = True
-            st.session_state.translate_file = sel
-            st.session_state.translate_dir = direction
-            st.rerun()
 
-        if translating:
-            fname = st.session_state.translate_file
-            tdir = st.session_state.translate_dir
-            path = UPLOAD_DIR / fname
-            if path.exists():
-                with st.status("Translating…", expanded=True) as status:
-                    bar = st.progress(0)
-                    preview = st.empty()
+def answer_question(question: str, k: int = 5) -> tuple[str, list]:
+    vs = get_vectorstore()
+    docs = vs.similarity_search(question, k=k)
 
-                    def update(done, total):
-                        bar.progress(done / total if total else 0.0)
-                        status.update(label=f"Translating piece {done}/{total}")
-
-                    def show_text(t):
-                        preview.markdown(t[-1500:])
-
-                    result, cached = get_translation(
-                        str(path), direction=tdir,
-                        progress_cb=update, text_cb=show_text,
-                    )
-                    label = ("Loaded from cache" if cached
-                             else f"Translation complete ({active_engine()})")
-                    status.update(label=label, state="complete")
-
-                arrow = "DE→EN" if tdir == "de-en" else "EN→DE"
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": f"**Translation of {fname} ({arrow}):**\n\n{result}",
-                })
-                st.session_state.last_translation = (fname, tdir, result)
-            else:
-                st.error("Original file not found on disk.")
-            st.session_state.translating = False
-            st.rerun()
-
-# ---------- Chat history ----------
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# ---------- Download last translation ----------
-if "last_translation" in st.session_state:
-    name, tdir, text = st.session_state.last_translation
-    suffix = "EN" if tdir == "de-en" else "DE"
-    st.download_button(
-        f"⬇️ Download last translation ({suffix})",
-        text,
-        file_name=f"{Path(name).stem}_{suffix}.txt",
+    context = "\n\n---\n\n".join(
+        f"[Source: {d.metadata.get('source', 'unknown')}]\n{d.page_content}"
+        for d in docs
     )
 
-# ---------- Chat input ----------
-if prompt := st.chat_input("Ask about your documents (German or English)"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    llm = get_llm()
+    messages = [
+        ("system", SYSTEM_PROMPT),
+        ("user", f"Context:\n{context}\n\nQuestion: {question}"),
+    ]
+    response = llm.invoke(messages)
+    return strip_think(response.content), docs
 
-    with st.chat_message("assistant"):
-        if not list_sources():
-            reply = "No documents indexed yet. Upload files in the sidebar first."
-            st.markdown(reply)
+
+def translate_document(path: str, chunk_chars: int = 3000,
+                       progress_cb=None, text_cb=None, target: str = "en") -> str:
+    """LLM fallback translation. target: 'en' or 'de'."""
+    text = extract_text(path)
+    llm = get_llm()
+
+    lang = "English" if target == "en" else "German"
+    prompt = (f"Translate the following text to {lang}. Preserve structure, "
+              f"headings, and lists. Output only the translation, nothing else.\n\n"
+              f"Text:\n{{text}}\n/no_think")
+
+    paragraphs = text.split("\n\n")
+    chunks, current = [], ""
+    for p in paragraphs:
+        if len(current) + len(p) > chunk_chars and current:
+            chunks.append(current)
+            current = p
         else:
-            with st.spinner("Thinking…"):
-                reply, docs = answer_question(prompt)
-            st.markdown(reply)
-            with st.expander("Sources"):
-                for d in docs:
-                    st.caption(
-                        f"**{d.metadata.get('source')}** (chunk {d.metadata.get('chunk')})"
-                    )
-                    st.text(d.page_content[:300])
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+            current = f"{current}\n\n{p}" if current else p
+    if current:
+        chunks.append(current)
+
+    if progress_cb:
+        progress_cb(0, len(chunks))
+
+    translated = []
+    for i, chunk in enumerate(chunks):
+        partial = ""
+        for piece in llm.stream([("user", prompt.format(text=chunk))]):
+            partial += piece.content
+            if text_cb:
+                text_cb("\n\n".join(translated) + "\n\n" + partial)
+        translated.append(strip_think(partial))
+        if progress_cb:
+            progress_cb(i + 1, len(chunks))
+    return "\n\n".join(translated)
